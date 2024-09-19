@@ -11,6 +11,8 @@ import argparse
 import itertools
 from collections.abc import Callable
 
+# ipctk.set_num_threads(8)
+
 
 def combine(V: list, C: list):
     Vsizes = [Vi.shape[0] for Vi in V]
@@ -83,8 +85,8 @@ class Parameters():
                  hep: pbat.fem.HyperElasticPotential,
                  dt: float,
                  cmesh: ipctk.CollisionMesh,
-                 cconstraints: ipctk.CollisionConstraints,
-                 fconstraints: ipctk.FrictionConstraints,
+                 cconstraints: ipctk.Collision,
+                 fconstraints: ipctk.FrictionCollisions,
                  dhat: float = 1e-3,
                  dmin: float = 1e-4,
                  mu: float = 0.3,
@@ -118,6 +120,7 @@ class Parameters():
 
 
 class Potential():
+
     def __init__(self, params: Parameters):
         self.params = params
 
@@ -144,17 +147,20 @@ class Potential():
         BX = to_surface(x, mesh, cmesh)
         BXdot = to_surface(v, mesh, cmesh)
         cconstraints.build(cmesh, BX, dhat, dmin=dmin)
-        fconstraints.build(cmesh, BX, cconstraints, dhat, kB, mu)
-        EB = cconstraints.compute_potential(cmesh, BX, dhat)
-        EF = fconstraints.compute_potential(cmesh, BXdot, epsv)
+        
+        # Create a BarrierPotential object and use it in the build method
+        B = ipctk.BarrierPotential(dhat)
+        fconstraints.build(cmesh, BX, cconstraints, B, kB, mu)
+        
+        EB = B(cconstraints, cmesh, BX)
+        D = ipctk.FrictionPotential(epsv)
+        EF = D(fconstraints, cmesh, BXdot)
         return 0.5 * (x - xtilde).T @ M @ (x - xtilde) + dt2*U + kB * EB + dt2*EF
 
 
 class Gradient():
     def __init__(self, params: Parameters):
         self.params = params
-        self.gradU = None
-        self.gradB = None
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         dt = self.params.dt
@@ -177,8 +183,11 @@ class Gradient():
         gU = hep.gradient()
         v = (x - xt) / dt
         BX = to_surface(x, mesh, cmesh)
-        cconstraints.build(cmesh, BX, dhat, dmin=dmin)
-        gB = cconstraints.compute_potential_gradient(cmesh, BX, dhat)
+
+        # Create a BarrierPotential object and use it in the build method
+        B = ipctk.BarrierPotential(dhat)
+        barrier_potential = B(cconstraints, cmesh, BX)
+        gB = B.gradient(cconstraints, cmesh, BX)
         gB = cmesh.to_full_dof(gB)
 
         # Cannot compute gradient without barrier stiffness
@@ -188,8 +197,13 @@ class Gradient():
 
         kB = self.params.kB
         BXdot = to_surface(v, mesh, cmesh)
-        fconstraints.build(cmesh, BX, cconstraints, dhat, kB, mu)
-        gF = fconstraints.compute_potential_gradient(cmesh, BXdot, epsv)
+        
+        # Use the BarrierPotential in the build method
+        fconstraints.build(cmesh, BX, cconstraints, B, kB, mu)
+        
+        D = ipctk.FrictionPotential(epsv)
+        friction_potential = D(fconstraints, cmesh, BXdot)
+        gF = D.gradient(fconstraints, cmesh, BXdot)
         gF = cmesh.to_full_dof(gF)
         g = M @ (x - xtilde) + dt2*gU + kB * gB + dt*gF
         return g
@@ -215,18 +229,27 @@ class Hessian():
         epsv = self.params.epsv
         kB = self.params.kB
 
+        # Compute the Hessian of the elastic potential
         hep.compute_element_elasticity(x, grad=False, hessian=True)
         HU = hep.hessian()
+        
+        # Velocity
         v = (x - xt) / dt
         BX = to_surface(x, mesh, cmesh)
         BXdot = to_surface(v, mesh, cmesh)
-        HB = cconstraints.compute_potential_hessian(
-            cmesh, BX, dhat, project_hessian_to_psd=True)
+
+        # Compute the Hessian of the barrier potential using the correct signature
+        B = ipctk.BarrierPotential(dhat)
+        HB = B.hessian(cconstraints, cmesh, BX, project_hessian_to_psd=ipctk.PSDProjectionMethod.NONE)  # Use ipctk.PSDProjectionMethod.NONE or appropriate method
         HB = cmesh.to_full_dof(HB)
-        HF = fconstraints.compute_potential_hessian(
-            cmesh, BXdot, epsv, project_hessian_to_psd=True)
+        
+        # Compute the Hessian of the friction dissipative potential
+        D = ipctk.FrictionPotential(epsv)
+        HF = D.hessian(fconstraints, cmesh, BXdot, project_hessian_to_psd=ipctk.PSDProjectionMethod.NONE)  # Use ipctk.PSDProjectionMethod.NONE or appropriate method
         HF = cmesh.to_full_dof(HF)
-        H = M + dt2*HU + kB * HB + HF
+        
+        # Combine Hessians
+        H = M + dt2*HU + kB * HB + dt*HF
         return H
 
 
@@ -252,7 +275,6 @@ class LinearSolver():
 
 
 class CCD():
-
     def __init__(self,
                  params: Parameters,
                  broad_phase_method: ipctk.BroadPhaseMethod = ipctk.BroadPhaseMethod.HASH_GRID):
@@ -278,7 +300,6 @@ class CCD():
 
 
 class BarrierInitializer():
-
     def __init__(self, params: Parameters):
         self.params = params
 
@@ -289,10 +310,14 @@ class BarrierInitializer():
         dmin = self.params.dmin
         avgmass = self.params.avgmass
         bboxdiag = self.params.bboxdiag
+        cconstraints = self.params.cconstraints
+
         # Compute adaptive barrier stiffness
         BX = to_surface(x, mesh, cmesh)
-        kB, maxkB = ipctk.initial_barrier_stiffness(
-            bboxdiag, dhat, avgmass, gU, gB, dmin=dmin)
+        B = ipctk.BarrierPotential(dhat)
+        barrier_potential = B(cconstraints, cmesh, V)
+        gB = B.gradient(cconstraints, cmesh, V)
+        kB, maxkB = ipctk.initial_barrier_stiffness(bboxdiag, B.barrier, dhat, avgmass, gU, gB, dmin=dmin)
         dprev = cconstraints.compute_minimum_distance(cmesh, BX)
         self.params.kB = kB
         self.params.maxkB = maxkB
@@ -300,7 +325,6 @@ class BarrierInitializer():
 
 
 class BarrierUpdater():
-
     def __init__(self, params: Parameters):
         self.params = params
 
@@ -311,6 +335,9 @@ class BarrierUpdater():
         maxkB = self.params.maxkB
         dprev = self.params.dprev
         bboxdiag = self.params.bboxdiag
+        dhat = self.params.dhat
+        dmin = self.params.dmin
+        cconstraints = self.params.cconstraints
 
         BX = to_surface(xk, mesh, cmesh)
         dcurrent = cconstraints.compute_minimum_distance(cmesh, BX)
@@ -403,8 +430,8 @@ if __name__ == "__main__":
     E = ipctk.edges(F)
     cmesh = ipctk.CollisionMesh.build_from_full_mesh(V, E, F)
     dhat = 1e-3
-    cconstraints = ipctk.CollisionConstraints()
-    fconstraints = ipctk.FrictionConstraints()
+    cconstraints = ipctk.Collisions()
+    fconstraints = ipctk.FrictionCollisions()
     mu = 0.3
     epsv = 1e-4
     dmin = 1e-4
